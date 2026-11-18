@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Turbo Coast</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden}
+  canvas{width:min(100vw,160vh);aspect-ratio:8/5;image-rendering:pixelated;background:#000;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c" width="640" height="400"></canvas>
+<script>
+'use strict';
+/* =====================  TURBO COAST  =====================
+   Carreras pseudo-3D estilo arcade clásico.
+   Controles: flechas / WASD  (arriba = acelerar, abajo = frenar)
+   Espacio/Enter = empezar, M = silenciar
+   ======================================================== */
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const W = 640, H = 400;
+const STEP = 1/60;
+
+// --- parámetros de la carretera / cámara ---
+const roadWidth = 2000, segLen = 200, rumbleLen = 3, lanes = 4;
+const camH = 1000, drawDist = 250, fov = 100;
+const camDepth = 1/Math.tan((fov/2)*Math.PI/180);
+const playerZ = camH*camDepth;
+const maxSpeed = segLen/STEP;
+const ACCEL = maxSpeed/5, BRAKING = -maxSpeed, DECEL = -maxSpeed/5;
+const OFF_DECEL = -maxSpeed/2, OFF_LIMIT = maxSpeed/4, CENTRIFUGAL = 0.3;
+const CAR_W = 0.27;            // ancho de coche (en semianchos de carretera)
+
+// --- utilidades ---
+const rnd = (a,b)=>a+Math.random()*(b-a);
+const limit = (v,a,b)=>Math.max(a,Math.min(v,b));
+const lerp = (a,b,p)=>a+(b-a)*p;
+const easeIn = (a,b,p)=>a+(b-a)*p*p;
+const easeInOut = (a,b,p)=>a+(b-a)*(-Math.cos(p*Math.PI)/2+0.5);
+const incr = (s,inc,max)=>{ let r=s+inc; while(r>=max) r-=max; while(r<0) r+=max; return r; };
+const pctRem = (n,total)=>(n%total)/total;
+const overlap = (x1,w1,x2,w2)=>Math.abs(x1-x2)<(w1+w2)/2;
+
+// --- circuito ---
+let segments = [], trackLength = 0, cars = [];
+const lastY = ()=>segments.length ? segments[segments.length-1].p2.world.y : 0;
+
+function addSegment(curve,y){
+  const n = segments.length;
+  segments.push({
+    index:n,
+    p1:{world:{y:lastY(),z:n*segLen},camera:{},screen:{}},
+    p2:{world:{y:y,z:(n+1)*segLen},camera:{},screen:{}},
+    curve, sprites:[], cars:[], clip:0, looped:false
+  });
+}
+function addRoad(enter,hold,leave,curve,y){
+  const startY = lastY(), endY = startY + Math.trunc(y)*segLen, total = enter+hold+leave;
+  for(let n=0;n<enter;n++) addSegment(easeIn(0,curve,n/enter), easeInOut(startY,endY,n/total));
+  for(let n=0;n<hold;n++)  addSegment(curve, easeInOut(startY,endY,(enter+n)/total));
+  for(let n=0;n<leave;n++) addSegment(easeInOut(curve,0,n/leave), easeInOut(startY,endY,(enter+hold+n)/total));
+}
+const LEN = {S:25, M:50, L:100}, CUR = {E:2, M:4, H:6}, HIL = {L:20, M:40, H:60};
+const aStraight = n=>addRoad(n,n,n,0,0);
+const aHill = (n,h)=>addRoad(n,n,n,0,h);
+const aCurve = (n,c,h=0)=>addRoad(n,n,n,c,h);
+
+const SPR = {
+  palm:{w:0.55, ratio:2.4, hit:0.25},
+  rock:{w:0.40, ratio:0.65, hit:0.35},
+  sign:{w:0.90, ratio:0.75, hit:0.55},
+  gate:{w:2.40, ratio:0.50, hit:0}
+};
+
+function buildTrack(){
+  segments = [];
+  aStraight(LEN.S);
+  aHill(LEN.M, HIL.L);
+  aCurve(LEN.M, CUR.E, 0);
+  aHill(LEN.S, HIL.M);
+  aCurve(LEN.M, -CUR.M, -HIL.L);
+  aStraight(LEN.S);
+  aCurve(LEN.L, CUR.M, HIL.M);
+  aHill(LEN.M, -HIL.M);
+  aCurve(LEN.M, -CUR.H, HIL.L);
+  aStraight(LEN.S);
+  aHill(LEN.L, HIL.H);
+  aCurve(LEN.M, CUR.H, -HIL.H);
+  aCurve(LEN.M, -CUR.E, 0);
+  aStraight(LEN.S);
+  addRoad(LEN.S, LEN.S, LEN.S, 0, -lastY()/segLen);   // vuelve a y=0 para cerrar el bucle
+  trackLength = segments.length*segLen;
+
+  // decorado
+  for(let n=8;n<segments.length-8;n+=3+Math.floor(Math.random()*5)){
+    const r = Math.random();
+    const type = r<0.6?'palm':(r<0.8?'rock':'sign');
+    const side = Math.random()<0.5?-1:1;
+    segments[n].sprites.push({type, offset:side*rnd(1.35,2.8)});
+    if(Math.random()<0.4) segments[n].sprites.push({type:Math.random()<0.7?'palm':'rock', offset:-side*rnd(1.35,3.2)});
+  }
+  // puertas de checkpoint (3 por vuelta)
+  for(let k=0;k<3;k++){
+    const idx = Math.round(k*segments.length/3)+6;
+    segments[idx].sprites = [{type:'gate', offset:0}];
+  }
+}
+
+const LANE_X = [-0.75,-0.25,0.25,0.75];
+const LANE_SPD = [0.20,0.27,0.34,0.42];
+const CAR_COLORS = ['#2aa7ff','#ffd400','#f2f2f2','#a24bff','#22cc66','#ff8a00','#00d9c0'];
+function buildCars(){
+  for(const s of segments) s.cars.length = 0;
+  cars = [];
+  for(let l=0;l<4;l++){
+    let z = segLen*rnd(40,80);
+    while(z < trackLength-segLen*30){
+      const car = {offset:LANE_X[l], z, speed:maxSpeed*LANE_SPD[l], color:CAR_COLORS[Math.floor(Math.random()*CAR_COLORS.length)], w:CAR_W};
+      cars.push(car);
+      findSeg(z).cars.push(car);
+      z += segLen*rnd(22,70);
+    }
+  }
+}
+const findSeg = z => segments[Math.floor(z/segLen) % segments.length];
+
+// --- zonas de color (verde → playa → atardecer) ---
+const ZONES = [
+  {grass:['#2fae3a','#27a032']},
+  {grass:['#ecc979','#dfba66']},
+  {grass:['#2c8f78','#25826c']}
+];
+const zoneOf = idx => Math.min(2, Math.floor(idx/(segments.length/3)));
+
+// --- estado del juego ---
+let state = 'title';           // title | play | over
+let position=0, speed=0, playerX=0, time=60, score=0, lastCp=0, shake=0, skyOff=0;
+let hi = 0; try{ hi = +localStorage.getItem('turbocoast_hi')||0; }catch(e){}
+let msg = {text:'', t:0}, overT = 0, steerVis = 0, tick = 0;
+const keys = {};
+
+function resetGame(){
+  buildCars();
+  position=0; speed=0; playerX=0; time=60; score=0; lastCp=0; shake=0; overT=0;
+  state='play';
+  showMsg('¡ARRANCA!',1.4);
+}
+function showMsg(t,d){ msg.text=t; msg.t=d; }
+
+// --- sonido ---
+let ac=null, osc=null, gain=null, muted=false;
+function initAudio(){
+  if(ac) return;
+  try{
+    ac = new (window.AudioContext||window.webkitAudioContext)();
+    osc = ac.createOscillator(); osc.type='sawtooth';
+    const lp = ac.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=700;
+    gain = ac.createGain(); gain.gain.value=0;
+    osc.connect(lp); lp.connect(gain); gain.connect(ac.destination);
+    osc.start();
+  }catch(e){ ac=null; }
+}
+function beep(f,d,type='square',v=0.06){
+  if(!ac||muted) return;
+  const o=ac.createOscillator(), g=ac.createGain();
+  o.type=type; o.frequency.value=f; g.gain.value=v;
+  g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime+d);
+  o.connect(g); g.connect(ac.destination); o.start(); o.stop(ac.currentTime+d);
+}
+function crashSound(){ beep(90,0.25,'sawtooth',0.12); beep(55,0.35,'square',0.08); }
+
+// --- entrada ---
+addEventListener('keydown',e=>{
+  keys[e.code]=true;
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+  if(e.code==='KeyM'){ muted=!muted; }
+  if(e.code==='Space'||e.code==='Enter') startPressed();
+});
+function startPressed(){
+  initAudio(); if(ac&&ac.state==='suspended') ac.resume();
+  if(state==='title' || (state==='over' && overT>1.2)) resetGame();
+}
+addEventListener('keyup',e=>{ keys[e.code]=false; });
+const kLeft=()=>keys.ArrowLeft||keys.KeyA, kRight=()=>keys.ArrowRight||keys.KeyD;
+const kUp=()=>keys.ArrowUp||keys.KeyW, kDown=()=>keys.ArrowDown||keys.KeyS;
+
+// --- lógica ---
+function update(dt){
+  tick += dt;
+  const pSeg = findSeg(position+playerZ);
+  const sp = speed/maxSpeed;
+
+  // tráfico
+  for(const car of cars){
+    const old = findSeg(car.z);
+    car.z = incr(car.z, dt*car.speed, trackLength);
+    const nw = findSeg(car.z);
+    if(old!==nw){ old.cars.splice(old.cars.indexOf(car),1); nw.cars.push(car); }
+  }
+  if(shake>0) shake = Math.max(0, shake-dt*1.5);
+  if(msg.t>0) msg.t-=dt;
+
+  if(state==='title'){
+    speed = maxSpeed*0.5;
+    position = incr(position, dt*speed, trackLength);
+    playerX = Math.sin(position/9000)*0.4;
+    skyOff += pSeg.curve*0.5*dt*90;
+    return;
+  }
+
+  const ctl = state==='play';
+  const dx = dt*2*sp;
+  const L = ctl&&kLeft(), R = ctl&&kRight();
+  position = incr(position, dt*speed, trackLength);
+
+  if(L) playerX -= dx; else if(R) playerX += dx;
+  steerVis = lerp(steerVis, L?-1:(R?1:0), 0.2);
+  playerX -= dx*sp*pSeg.curve*CENTRIFUGAL;
+
+  if(ctl&&kUp()) speed += ACCEL*dt;
+  else if(ctl&&kDown()) speed += BRAKING*dt;
+  else speed += (state==='over'?DECEL*2:DECEL)*dt;
+
+  if((playerX<-1||playerX>1)){
+    if(speed>OFF_LIMIT) speed += OFF_DECEL*dt;
+    for(const s of pSeg.sprites){
+      const T = SPR[s.type]; if(!T.hit) continue;
+      if(overlap(playerX, CAR_W, s.offset, T.hit)){
+        speed = maxSpeed/5;
+        playerX = s.offset>0 ? s.offset-(T.hit+CAR_W)/2-0.03 : s.offset+(T.hit+CAR_W)/2+0.03;
+        shake = 0.5; crashSound();
+        break;
+      }
+    }
+  }
+  for(const car of pSeg.cars){
+    if(speed>car.speed && overlap(playerX, CAR_W, car.offset, car.w)){
+      speed = car.speed*0.55;
+      position = incr(car.z, -playerZ, trackLength);
+      shake = 0.6; crashSound();
+      break;
+    }
+  }
+  playerX = limit(playerX,-3,3);
+  speed = limit(speed,0,maxSpeed);
+  skyOff += pSeg.curve*sp*dt*90;
+
+  if(state==='play'){
+    score += speed*dt/60;
+    time -= dt;
+    const cp = Math.floor(incr(position,playerZ,trackLength)/(trackLength/3));
+    if(cp!==lastCp){ lastCp=cp; time += 18; showMsg('CHECKPOINT  +18s',2); beep(880,0.15); setTimeout(()=>beep(1175,0.25),140); }
+    if(time<=0){
+      time=0; state='over'; overT=0; showMsg('',0);
+      if(score>hi){ hi=Math.floor(score); try{localStorage.setItem('turbocoast_hi',hi);}catch(e){} }
+    }
+  } else overT += dt;
+
+  if(osc){
+    const g = Math.floor(sp*4.999), within = (sp*4.999)%1;
+    osc.frequency.value = 55 + g*18 + within*110;
+    gain.gain.value = muted?0:(0.035+sp*0.03);
+  }
+}
+
+// --- dibujo ---
+function poly(x1,y1,x2,y2,x3,y3,x4,y4,c){
+  ctx.fillStyle=c; ctx.beginPath();
+  ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.lineTo(x3,y3); ctx.lineTo(x4,y4);
+  ctx.closePath(); ctx.fill();
+}
+function txt(s,x,y,size,color,align='left'){
+  ctx.font = `bold ${size}px "Arial Black",Impact,sans-serif`;
+  ctx.textAlign=align; ctx.textBaseline='top';
+  ctx.lineWidth=Math.max(2,size/5); ctx.lineJoin='round'; ctx.strokeStyle='#000';
+  ctx.strokeText(s,x,y); ctx.fillStyle=color; ctx.fillText(s,x,y);
+}
+function project(p,camX,camY,camZ){
+  p.camera.x = (p.world.x||0)-camX;
+  p.camera.y = p.world.y-camY;
+  p.camera.z = p.world.z-camZ;
+  p.screen.scale = camDepth/p.camera.z;
+  p.screen.x = Math.round(W/2 + p.screen.scale*p.camera.x*W/2);
+  p.screen.y = Math.round(H/2 - p.screen.scale*p.camera.y*H/2);
+  p.screen.w = Math.round(p.screen.scale*roadWidth*W/2);
+}
+
+function drawSegment(x1,y1,w1,x2,y2,w2,idx){
+  const dark = Math.floor(idx/rumbleLen)%2===1;
+  ctx.fillStyle = ZONES[zoneOf(idx)].grass[dark?1:0];
+  ctx.fillRect(0,y2,W,y1-y2);
+  const r1 = w1/Math.max(6,2*lanes), r2 = w2/Math.max(6,2*lanes);
+  const rc = dark?'#f4f4f4':'#d4202a';
+  poly(x1-w1-r1,y1,x1-w1,y1,x2-w2,y2,x2-w2-r2,y2,rc);
+  poly(x1+w1+r1,y1,x1+w1,y1,x2+w2,y2,x2+w2+r2,y2,rc);
+  poly(x1-w1,y1,x1+w1,y1,x2+w2,y2,x2-w2,y2, dark?'#585862':'#5f5f69');
+  if(!dark){
+    const l1 = w1/Math.max(32,8*lanes), l2 = w2/Math.max(32,8*lanes);
+    const lw1 = w1*2/lanes, lw2 = w2*2/lanes;
+    let lx1 = x1-w1+lw1, lx2 = x2-w2+lw2;
+    for(let l=1;l<lanes;l++,lx1+=lw1,lx2+=lw2)
+      poly(lx1-l1/2,y1,lx1+l1/2,y1,lx2+l2/2,y2,lx2-l2/2,y2,'#e8e8e8');
+  }
+}
+
+function ridge(off,amp,freqs,color,base){
+  ctx.fillStyle=color; ctx.beginPath(); ctx.moveTo(0,base);
+  for(let x=0;x<=W;x+=4){
+    const u=(x+off)/960*Math.PI*2; let h=0;
+    for(const f of freqs) h+=f[1]*Math.sin(f[0]*u+f[2]);
+    ctx.lineTo(x,base-amp-h);
+  }
+  ctx.lineTo(W,base); ctx.closePath(); ctx.fill();
+}
+function drawBg(pSeg){
+  const g = ctx.createLinearGradient(0,0,0,H/2);
+  g.addColorStop(0,'#2a1a6e'); g.addColorStop(0.55,'#d9468f'); g.addColorStop(1,'#ffb35c');
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H/2+2);
+  // sol
+  const sg = ctx.createLinearGradient(0,H/2-95,0,H/2);
+  sg.addColorStop(0,'#fff27a'); sg.addColorStop(1,'#ff4f9a');
+  ctx.fillStyle=sg; ctx.beginPath(); ctx.arc(W*0.68-(skyOff*0.05)%40,H/2-14,52,0,Math.PI*2); ctx.fill();
+  ridge(skyOff*0.4,26,[[2,12,0],[5,7,1],[9,4,2]],'#7a3b86',H/2+4);
+  ridge(skyOff*0.9,14,[[3,9,2],[7,5,0],[11,3,1]],'#3b2a63',H/2+4);
+  ctx.fillStyle = ZONES[zoneOf(pSeg.index)].grass[0];
+  ctx.fillRect(0,H/2+3,W,H/2);
+}
+
+// coche visto por detrás
+function drawCar(cx,by,w,c,spoiler,tilt){
+  ctx.save();
+  ctx.translate(cx,by); ctx.rotate(tilt||0); ctx.translate(-cx,-by);
+  ctx.fillStyle='rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(cx,by,w*0.56,w*0.09,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#111';
+  ctx.fillRect(cx-w*0.5,by-w*0.3,w*0.16,w*0.3); ctx.fillRect(cx+w*0.34,by-w*0.3,w*0.16,w*0.3);
+  ctx.fillStyle=c; ctx.fillRect(cx-w*0.46,by-w*0.4,w*0.92,w*0.26);
+  poly(cx-w*0.34,by-w*0.4, cx-w*0.22,by-w*0.62, cx+w*0.22,by-w*0.62, cx+w*0.34,by-w*0.4, c);
+  poly(cx-w*0.28,by-w*0.42, cx-w*0.19,by-w*0.58, cx+w*0.19,by-w*0.58, cx+w*0.28,by-w*0.42, '#16264a');
+  ctx.fillStyle='#ff2a2a';
+  ctx.fillRect(cx-w*0.44,by-w*0.37,w*0.2,w*0.08); ctx.fillRect(cx+w*0.24,by-w*0.37,w*0.2,w*0.08);
+  ctx.fillStyle='rgba(0,0,0,.35)'; ctx.fillRect(cx-w*0.46,by-w*0.2,w*0.92,w*0.07);
+  ctx.fillStyle='#eee'; ctx.fillRect(cx-w*0.09,by-w*0.3,w*0.18,w*0.07);
+  if(spoiler){
+    ctx.fillStyle='#222'; ctx.fillRect(cx-w*0.4,by-w*0.68,w*0.8,w*0.06);
+    ctx.fillRect(cx-w*0.36,by-w*0.64,w*0.05,w*0.12); ctx.fillRect(cx+w*0.31,by-w*0.64,w*0.05,w*0.12);
+  }
+  ctx.restore();
+}
+function drawPalm(cx,y,w){
+  const h=w*2.4, tx=cx+w*0.05, ty=y-h*0.9;
+  ctx.lineCap='round';
+  ctx.strokeStyle='#7a4a22'; ctx.lineWidth=Math.max(1,w*0.11);
+  ctx.beginPath(); ctx.moveTo(cx,y); ctx.quadraticCurveTo(cx+w*0.14,y-h*0.5,tx,ty); ctx.stroke();
+  ctx.strokeStyle='#1c9a3c'; ctx.lineWidth=Math.max(1,w*0.1);
+  const Lf=w*0.55;
+  for(const a of [-3.0,-2.4,-1.85,-1.3,-0.75,-0.15]){
+    ctx.beginPath(); ctx.moveTo(tx,ty);
+    ctx.quadraticCurveTo(tx+Math.cos(a)*Lf*0.5, ty+Math.sin(a)*Lf*0.8-w*0.05, tx+Math.cos(a)*Lf, ty+Math.sin(a)*Lf*0.2+Lf*0.35);
+    ctx.stroke();
+  }
+  ctx.fillStyle='#5a3a18'; ctx.beginPath(); ctx.arc(tx,ty+w*0.04,w*0.07,0,Math.PI*2); ctx.fill();
+}
+function drawRock(cx,y,w){
+  const h=w*0.65;
+  ctx.fillStyle='#8a7f86'; ctx.beginPath();
+  ctx.moveTo(cx-w/2,y); ctx.lineTo(cx-w*0.38,y-h*0.7); ctx.lineTo(cx-w*0.1,y-h);
+  ctx.lineTo(cx+w*0.3,y-h*0.8); ctx.lineTo(cx+w/2,y); ctx.closePath(); ctx.fill();
+  ctx.fillStyle='rgba(255,255,255,.2)'; ctx.beginPath();
+  ctx.moveTo(cx-w*0.1,y-h); ctx.lineTo(cx+w*0.3,y-h*0.8); ctx.lineTo(cx+w*0.05,y-h*0.45); ctx.lineTo(cx-w*0.25,y-h*0.7); ctx.fill();
+}
+function drawSign(cx,y,w){
+  const h=w*0.75;
+  ctx.fillStyle='#333';
+  ctx.fillRect(cx-w*0.38,y-h*0.7,w*0.05,h*0.7); ctx.fillRect(cx+w*0.33,y-h*0.7,w*0.05,h*0.7);
+  ctx.fillStyle='#fff'; ctx.fillRect(cx-w/2,y-h,w,h*0.5);
+  ctx.fillStyle='#e8212c'; ctx.fillRect(cx-w/2,y-h,w,h*0.15);
+  ctx.fillStyle='#1d5cff'; ctx.fillRect(cx-w/2,y-h*0.65,w,h*0.15);
+}
+function drawGate(cx,y,w){
+  const h=w*0.5;
+  ctx.fillStyle='#ddd';
+  ctx.fillRect(cx-w*0.49,y-h,w*0.04,h); ctx.fillRect(cx+w*0.45,y-h,w*0.04,h);
+  ctx.fillStyle='#e8212c'; ctx.fillRect(cx-w/2,y-h,w,h*0.24);
+  ctx.fillStyle='#fff'; ctx.fillRect(cx-w/2,y-h+h*0.24,w,h*0.04);
+  if(w>150){
+    ctx.font=`bold ${h*0.15}px "Arial Black",sans-serif`; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillStyle='#fff'; ctx.fillText('CHECKPOINT',cx,y-h+h*0.12);
+  }
+}
+const DRAW = {palm:drawPalm, rock:drawRock, sign:drawSign, gate:drawGate};
+
+function render(){
+  const baseSeg = findSeg(position), basePct = pctRem(position,segLen);
+  const pSeg = findSeg(position+playerZ), pPct = pctRem(position+playerZ,segLen);
+  const playerY = lerp(pSeg.p1.world.y,pSeg.p2.world.y,pPct);
+  let maxy=H, x=0, dx=-(baseSeg.curve*basePct);
+
+  ctx.save();
+  if(shake>0) ctx.translate(rnd(-1,1)*shake*8, rnd(-1,1)*shake*8);
+  drawBg(pSeg);
+
+  for(let n=0;n<drawDist;n++){
+    const seg = segments[(baseSeg.index+n)%segments.length];
+    seg.looped = seg.index<baseSeg.index;
+    seg.clip = maxy;
+    const cz = position-(seg.looped?trackLength:0);
+    project(seg.p1, playerX*roadWidth-x,    playerY+camH, cz);
+    project(seg.p2, playerX*roadWidth-x-dx, playerY+camH, cz);
+    x+=dx; dx+=seg.curve;
+    if(seg.p1.camera.z<=camDepth || seg.p2.screen.y>=seg.p1.screen.y || seg.p2.screen.y>=maxy) continue;
+    drawSegment(seg.p1.screen.x,seg.p1.screen.y,seg.p1.screen.w, seg.p2.screen.x,seg.p2.screen.y,seg.p2.screen.w, seg.index);
+    maxy = seg.p1.screen.y;
+  }
+
+  const sp = speed/maxSpeed;
+  for(let n=drawDist-1;n>=0;n--){
+    const seg = segments[(baseSeg.index+n)%segments.length];
+    const visible = seg.p1.camera.z>camDepth;
+    if(visible){
+      for(const car of seg.cars){
+        const pc = pctRem(car.z,segLen);
+        const sw = lerp(seg.p1.screen.w,seg.p2.screen.w,pc);
+        const sx = lerp(seg.p1.screen.x,seg.p2.screen.x,pc) + car.offset*sw;
+        const sy = lerp(seg.p1.screen.y,seg.p2.screen.y,pc);
+        const dw = car.w*sw;
+        if(dw<2 || sy-dw*0.7>=seg.clip) continue;
+        const clipIt = sy>seg.clip;
+        if(clipIt){ ctx.save(); ctx.beginPath(); ctx.rect(0,0,W,seg.clip); ctx.clip(); }
+        drawCar(sx,sy,dw,car.color,false,0);
+        if(clipIt) ctx.restore();
+      }
+      for(const s of seg.sprites){
+        const T = SPR[s.type];
+        const sw = seg.p1.screen.w, sx = seg.p1.screen.x + s.offset*sw, sy = seg.p1.screen.y;
+        const dw = T.w*sw;
+        if(dw<3 || sy-dw*T.ratio>=seg.clip) continue;
+        const clipIt = sy>seg.clip;
+        if(clipIt){ ctx.save(); ctx.beginPath(); ctx.rect(0,0,W,seg.clip); ctx.clip(); }
+        DRAW[s.type](sx,sy,dw);
+        if(clipIt) ctx.restore();
+      }
+    }
+    if(seg===pSeg && state!=='title'){
+      const ps = camDepth/playerZ;
+      const py = H/2 - ps*lerp(pSeg.p1.camera.y,pSeg.p2.camera.y,pPct)*H/2;
+      const pw = CAR_W*ps*roadWidth*W/2;
+      const off = (playerX<-1||playerX>1)?2.5:1;
+      const bounce = speed>0 ? rnd(-1,1)*1.2*sp*off : 0;
+      drawCar(W/2, py-10+bounce, pw, '#e8202c', true, steerVis*0.05*sp);
+    } else if(seg===pSeg){
+      const ps = camDepth/playerZ;
+      const py = H/2 - ps*lerp(pSeg.p1.camera.y,pSeg.p2.camera.y,pPct)*H/2;
+      drawCar(W/2+playerX*0, py-10, CAR_W*ps*roadWidth*W/2, '#e8202c', true, 0);
+    }
+  }
+  ctx.restore();
+  drawHud();
+}
+
+function drawHud(){
+  if(state==='title'){
+    txt('TURBO COAST',W/2,70,54,'#ffd23a','center');
+    txt('PULSA ESPACIO PARA EMPEZAR',W/2,170,20,(Math.floor(tick*2)%2)?'#fff':'#ff7ab8','center');
+    txt('↑ acelerar   ↓ frenar   ← → girar   M sonido',W/2,330,14,'#fff','center');
+    if(hi) txt('RÉCORD '+hi,W/2,356,14,'#9ff','center');
+    return;
+  }
+  txt('PUNTOS',14,8,12,'#ffd23a'); txt(String(Math.floor(score)).padStart(7,'0'),14,22,20,'#fff');
+  txt('RÉCORD',W-14,8,12,'#ffd23a','right'); txt(String(hi).padStart(7,'0'),W-14,22,20,'#fff','right');
+  txt('TIEMPO',W/2,6,12,'#ffd23a','center');
+  const low = time<10 && state==='play';
+  txt(String(Math.ceil(time)).padStart(2,'0'),W/2,18,38,(low&&Math.floor(tick*4)%2)?'#ff3030':'#fff','center');
+  txt(Math.round(speed/maxSpeed*330)+' km/h',W-14,H-34,24,'#fff','right');
+  if(msg.t>0 && msg.text) txt(msg.text,W/2,120,30,'#ffd23a','center');
+  if(state==='over'){
+    txt('GAME OVER',W/2,110,52,'#ff4a4a','center');
+    txt('PUNTUACIÓN '+Math.floor(score),W/2,180,22,'#fff','center');
+    if(overT>1.2) txt('ESPACIO PARA REINTENTAR',W/2,230,18,(Math.floor(tick*2)%2)?'#fff':'#ff7ab8','center');
+  }
+}
+
+// --- bucle principal ---
+buildTrack();
+buildCars();
+let last = performance.now(), acc = 0;
+function frame(now){
+  acc += Math.min(1,(now-last)/1000); last = now;
+  while(acc>STEP){ update(STEP); acc-=STEP; }
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
