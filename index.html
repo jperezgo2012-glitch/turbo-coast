@@ -234,7 +234,7 @@ function startPressed(){
 }
 addEventListener('keyup',e=>{ keys[e.code]=false; });
 const kLeft=()=>keys.ArrowLeft||keys.KeyA, kRight=()=>keys.ArrowRight||keys.KeyD;
-const kUp=()=>keys.ArrowUp||keys.KeyW, kDown=()=>keys.ArrowDown||keys.KeyS;
+const kUp=()=>keys.ArrowUp||keys.KeyW, kDown=()=>keys.ArrowDown||keys.KeyS||keys.KeyZ;
 
 // --- lógica ---
 function update(dt){
@@ -679,7 +679,7 @@ function drawHud(){
   if(state==='title'){
     txt('TURBO COAST',W/2,70,54,'#ffd23a','center');
     txt('PULSA ESPACIO PARA EMPEZAR',W/2,170,20,(Math.floor(tick*2)%2)?'#fff':'#ff7ab8','center');
-    txt('↑ acelerar   ↓ frenar   ← → girar   M sonido',W/2,330,14,'#fff','center');
+    txt('↑ acelerar   ↓/Z frenar   ← → girar   M sonido',W/2,330,14,'#fff','center');
     if(hi) txt('RÉCORD '+hi,W/2,356,14,'#9ff','center');
     return;
   }
